@@ -455,6 +455,21 @@ function makeBossRules(st){
       }
     return buf[c-1];
     },
+  // pickRankedLane과 같은 규칙을 생존 배열로 바로 계산한다(전투 엔진 전용, 판마다 여러 번 불린다). 둘을 함께 고치고, 회귀 테스트 S가 결과가 같은지 확인한다.
+  pickRankedLaneFromAlive(alive,n,u,buf){
+    const w=R.laneRankWeights;
+    let c=0,tot=0;
+    for(let l=0;l<10&&c<6;l++)if(alive[l]===1){buf[c]=l;tot+=w[c++];}
+    for(let l=0;l<10&&c<6;l++)if(alive[l]!==1&&l+10<n&&alive[l+10]===1){buf[c]=l;tot+=w[c++];}
+    if(!c)return -1;
+    const x=u*tot;
+    let acc=0;
+    for(let k=0;k<c;k++){
+      acc+=w[k];
+      if(x<acc)return buf[k];
+      }
+    return buf[c-1];
+    },
   // 열 l이 뽑힐 확률(근사 점수용)
   rankedLaneProbability(frontAlive,backAlive,lane){
     const buf=[];
@@ -502,7 +517,7 @@ function getPierceTargetWeights(team=dragons,expanded=false){
 function getPierceTargetProbabilityForIndex(i,team=dragons,expanded=false){
  const lane=i>=0&&i<10?i:i>=10&&i<20?i-10:-1;
  if(lane<0)return 0;
- return getPierceTargetWeights(team,expanded)[lane]||0;
+ return rankedLaneProbabilityFor(team,lane,{expanded})||0;
 }
 function getFrontSlotPierceExposureScore(i,team=dragons){
  if(i<0||i>=10||!pierceRosterAvailable(team,i))return 0;
@@ -2650,8 +2665,10 @@ function makeGearlessPositionSeed(inputTeam,{keepVirtualSpirits=false}={}){
  }
  return seed;
 }
+// 장비를 뺀 뒤 슬롯별 입력이 같은 배치는 재배정 결과도 같다(스탯이 같은 용끼리 자리를 바꾼 경우). 이름과 원래 자리만 다르다.
+function inventoryLayoutKey(layoutTeam){return JSON.stringify(makeGearlessPositionSeed(layoutTeam,{keepVirtualSpirits:false}).map(d=>{const {name,_positionOriginIndex,...rest}=d;return rest;}));}
 function makeInventoryPositionReallocator(pendantStrategy='configured'){
- return async function reallocateInventoryPositionCandidate(layoutTeam,context={}){
+ return Object.assign(async function reallocateInventoryPositionCandidate(layoutTeam,context={}){
   const mode=$('optimizationMode')?.value||'fast',accurate=mode==='accurate';
   // 배치 후보마다 같은 '현재 전체 재고' 스냅샷에서 독립적으로 시작한다.
   // 먼저 활성 용의 교체 가능한 장비를 모두 뺀다. 장착된 실물은 이미 인벤토리 수량에
@@ -2696,7 +2713,7 @@ function makeInventoryPositionReallocator(pendantStrategy='configured'){
   }
   variants.sort((a,b)=>(b.screenSimulation?.damage||-Infinity)-(a.screenSimulation?.damage||-Infinity));
   return {variants};
- };
+ },{layoutKey:inventoryLayoutKey});
 }
 function makeSpiritHighPositionReallocator(pendantStrategy='configured'){
  return async function reallocateSpiritHighPositionCandidate(layoutTeam,context={}){
@@ -6712,6 +6729,9 @@ function fbMix(x){x=Math.imul(x^(x>>>16),0x7feb352d);x=Math.imul(x^(x>>>15),0x84
 function fbRunBase(seed,run){return fbMix((Math.imul(seed|0,0x9E3779B1)^Math.imul((run+1)|0,0x85EBCA6B))>>>0);}
 // 0 <= u < 1. a,b,c: 정수 키
 function fbU(base,a,b,c){let x=(base^Math.imul(a+1,0xC2B2AE35))>>>0;x=fbMix(x^Math.imul(b+1,0x27D4EB2F));x=fbMix(x^Math.imul(c+1,0x165667B1));return x/4294967296;}
+// 같은 (a,b)에서 c만 다른 난수를 여러 개 뽑을 때 앞부분 계산을 나눠 쓴다. fbUPart(fbUPrefix(base,a,b),c)는 fbU(base,a,b,c)와 같은 값이다.
+function fbUPrefix(base,a,b){return fbMix(((base^Math.imul(a+1,0xC2B2AE35))>>>0)^Math.imul(b+1,0x27D4EB2F));}
+function fbUPart(prefix,c){return fbMix(prefix^Math.imul(c+1,0x165667B1))/4294967296;}
 function fbSnapshotConfig(termination){
   const g=id=>$(id),num=(id,f)=>{const v=parseFloat(g(id)?.value);return Number.isFinite(v)?v:f;};
   const boss=getBoss();
@@ -6748,7 +6768,8 @@ function fbSimulate(T,C,seed,run,S,out,work){
   const frontP=comp.frontPierceP,backP=RL.pierceBackP(comp,'alive'),laneDeadBackP=RL.pierceBackP(comp,'laneDead'),promotedBackP=RL.pierceBackP(comp,'wiped'),allP=comp.allP;
   const bossCritP=RL.critPct/100,lightDef=RL.settings.lightDefMult,singleShare=RL.normalSingleShare;
   // B8 열 선택용: 열 l의 앞 = 슬롯 l, 뒤 = 슬롯 l+10
-  const laneBuf=work.lanes||new Int16Array(10),laneFrontAlive=l=>alive[l]===1,laneBackAlive=l=>l+10<n&&alive[l+10]===1;
+  const laneBuf=work.lanes,missP=work.missP,guardP=work.guardP;
+  for(let i=0;i<n;i++){missP[i]=RL.missPct(T.dodge[i])/100;guardP[i]=RL.guardPct(T.dodge[i])/100;}
   let bossHp=C.bossHp,total=0,received=0;
   const bossDef=C.bossDef,bossAtk=C.bossAtk,critM=C.critMult,termFront=C.termination==='front';
   const frontAliveCount=()=>{let c=0;for(let i=0;i<n;i++)if(alive[i]&&T.front[i])c++;return c;};
@@ -6760,7 +6781,7 @@ function fbSimulate(T,C,seed,run,S,out,work){
   const dmgOut=(atk,crit,em,guard)=>{const x=Math.floor(atk*(crit?critM:1)*em);return Math.floor(44*x/(bossDef*(guard?3:1)+22));};
   const playerAct=(list,cnt,key)=>{
     for(let q=0;q<cnt;q++){if(bossHp<=0)break;const i=list[q],o=i*FB_NK;S[o]++;
-      const crit=fbU(base,key,i,0)<T.crit[i],guard=fbU(base,key,i,1)<C.bossGuard/100,ev=fbU(base,key,i,2)<C.bossDodge/100;
+      const h=fbUPrefix(base,key,i),crit=fbUPart(h,0)<T.crit[i],guard=fbUPart(h,1)<C.bossGuard/100,ev=fbUPart(h,2)<C.bossDodge/100;
       if(ev){S[o+2]++;continue;}
       let d=dmgOut(T.atk[i],crit,T.dark[i]?C.darkAtkMult:1,guard);d=Math.min(d,bossHp);bossHp-=d;total+=d;S[o+1]+=d;if(crit)S[o+3]++;if(guard)S[o+4]++;}
   };
@@ -6771,8 +6792,9 @@ function fbSimulate(T,C,seed,run,S,out,work){
   const hit=(i,p,turn,order)=>{
     if(!alive[i])return;const o=i*FB_NK;S[o+5]++;
     const k=turn*4+order;
-    if(fbU(base,k+100000,i,0)<RL.missPct(T.dodge[i])/100){S[o+6]++;S[o+11]++;return;}
-    const defended=fbU(base,k+100000,i,1)<RL.guardPct(T.dodge[i])/100,crit=fbU(base,k+100000,i,2)<bossCritP;
+    const h=fbUPrefix(base,k+100000,i);
+    if(fbUPart(h,0)<missP[i]){S[o+6]++;S[o+11]++;return;}
+    const defended=fbUPart(h,1)<guardP[i],crit=fbUPart(h,2)<bossCritP;
     const tem=T.light[i]?lightDef:1;
     const x=Math.floor(bossAtk*p*(crit?2:1));const dmg=Math.max(0,Math.floor(44*x/(T.def[i]*(defended?3:1)*tem+22)));
     if(defended)S[o+7]++;if(crit)S[o+9]++;else if(!defended)S[o+8]++;
@@ -6789,7 +6811,7 @@ function fbSimulate(T,C,seed,run,S,out,work){
     if(isAll){for(let i=0;i<n;i++)if(alive[i]){targets[tc]=i;tp[tc]=allP;tc++;}}
     if(isPierce){
       // B8(v2.10): 순위 후보 6열 중 하나. 후보가 없으면(-1) 관통 타격 없음.
-      const idx=RL.pickRankedLane(laneFrontAlive,laneBackAlive,fbU(base,turn+200000,0,0),laneBuf);
+      const idx=RL.pickRankedLaneFromAlive(alive,n,fbU(base,turn+200000,0,0),laneBuf);
       if(idx>=0){
         const promoted=frontAliveCount()===0;
         if(alive[idx]){targets[tc]=idx;tp[tc]=frontP;tc++;}
@@ -6803,7 +6825,7 @@ function fbSimulate(T,C,seed,run,S,out,work){
       else{let strong=false;if(RL.singleStrong)strong=fbU(base,turn+300000,1,0)<RL.singleStrongP;
         const sp=RL.singleP(strong);
         // B2·B8: 순위 후보 6열 중 하나를 고르고, 앞이 전투불능이면 같은 열의 뒤를 공격.
-        const l=RL.pickRankedLane(laneFrontAlive,laneBackAlive,fbU(base,turn+300000,2,0),laneBuf);
+        const l=RL.pickRankedLaneFromAlive(alive,n,fbU(base,turn+300000,2,0),laneBuf);
         if(l>=0){targets[tc]=alive[l]?l:l+10;tp[tc]=sp;tc++;}
 
       }
@@ -6839,7 +6861,7 @@ function fbSimulate(T,C,seed,run,S,out,work){
 }
 function fbWork(n){
   return {
-    hp:new Float64Array(n),alive:new Uint8Array(n),tmp:new Int16Array(n),back:new Int16Array(n),tl:new Int16Array(n),targets:new Int16Array(64),tp:new Float64Array(64),seen:new Uint8Array(n),lanes:new Int16Array(10)
+    hp:new Float64Array(n),alive:new Uint8Array(n),tmp:new Int16Array(n),back:new Int16Array(n),tl:new Int16Array(n),targets:new Int16Array(64),tp:new Float64Array(64),seen:new Uint8Array(n),lanes:new Int16Array(10),missP:new Float64Array(n),guardP:new Float64Array(n)
   };
   }
 /* 팀을 runs 회 평가하고 evaluateBattleTeam 과 같은 모양의 결과를 반환(동기). */
@@ -7131,14 +7153,15 @@ async function optimizeRosterPositions(inputTeam,{preliminary=false,jointMode=fa
   const mode=$('optimizationMode')?.value||'fast',accurate=mode==='accurate';
   const rawSeed=readSimulationSeed($('seed')?.value,42),C=fbSnapshotConfig('all');
   const doPolish=!!polish;
-  const baseBudget=accurate?150000:45000,candBudget=accurate?25000:8000;
+  // 탐색은 더 바꿀 게 없으면 스스로 끝난다. 제한은 느린 기기와 가려진 창에서 탐색이 잘리지 않을 만큼 넉넉히 둔다.
+  const baseBudget=accurate?150000:45000,candBudget=accurate?60000:30000;
   const screenRuns=accurate?96:64,verifyA=accurate?192:128,verifyB=accurate?576:384,finalRuns=accurate?2000:1000,shortlistSize=accurate?6:4,maxPasses=preliminary?1:(accurate?3:2);
   const status=t=>{const el=$('inventoryApplyStatus');if(el)el.textContent=t;};
   const fixRows=t=>t.map((d,i)=>({...d,row:i<10?'front':'back',role:i<10?'tank':'attack'}));
   const originalTeam=cloneOptimizerTeam(inputTeam);
   let team=fixRows(cloneOptimizerTeam(inputTeam).map((d,i)=>({...d,_positionOriginIndex:Number.isInteger(d?._positionOriginIndex)?d._positionOriginIndex:i})));
   const reviewRows=[],acceptedLabels=[],polishLog=[];
-  let totalLayouts=0,totalSwapLayouts=0,totalCycleLayouts=0,blockSwapCandidates=0,darkBackCandidates=0,totalCandidates=0,totalRealloc=0,failedRealloc=0,acceptedMoves=0,polishMoves=0,structuralCount=0,polishSweeps=0;
+  let totalLayouts=0,totalSwapLayouts=0,totalCycleLayouts=0,blockSwapCandidates=0,darkBackCandidates=0,totalCandidates=0,totalRealloc=0,reusedRealloc=0,failedRealloc=0,acceptedMoves=0,polishMoves=0,structuralCount=0,polishSweeps=0;
   const ctx={work:fbWork(20),S:new Float64Array(20*FB_NK)};
   const polishTeam=async(t,label,budget)=>{
     if(!doPolish)return {team:t,accepted:[]};
@@ -7200,12 +7223,22 @@ async function optimizeRosterPositions(inputTeam,{preliminary=false,jointMode=fa
     }
     if(!picked.length)break;
     // 2) 후보 완성: 장비 동반 이동안을 실제 전투로 다시 다듬는다(정확 모드는 재고 재배정안도 추가).
-    const cands=[];
+    const cands=[],layoutResults=new Map();
     for(let q=0;q<picked.length;q++){
       const L=picked[q],label=L.label||(L.kind==='structural'?'위험도 정렬 배치':L.kind==='swap'?`${L.rowLabel} ${L.i+1}번↔${L.j+1}번`:L.kind==='cycle'?positionCycleLabel(team,L.i,L.j,L.k,L.direction):'자리 후보');
       status(`자리 후보 ${q+1}/${picked.length} · ${withRealloc?'전체 재고 재배정':'장비 동반 이동'} · ${label}`);
       if(withRealloc){
         try{
+          // 재배정 입력이 앞 후보와 같으면 다시 계산하지 않고 그 장비를 이 배치의 용에게 그대로 입힌다. 표본도 같으므로 검증에서 나눠 쓴다.
+          const layoutKey=jointReallocate.layoutKey?jointReallocate.layoutKey(L.layoutTeam):null,sameLayout=layoutKey?layoutResults.get(layoutKey):null;
+          if(sameLayout){
+            for(const first of sameLayout){
+              cands.push({label:`${label} · 전체 인벤토리 재배정${first.orderText}${first.polished.length?` + 정밀 교환 ${first.polished.length}회`:''}`,team:first.team.map((d,i)=>({...d,name:L.layoutTeam[i].name,_positionOriginIndex:L.layoutTeam[i]._positionOriginIndex})),kind:L.kind,reallocated:true,polished:first.polished,sameAs:first});
+              totalRealloc++;reusedRealloc++;
+            }
+            await yieldToBrowser();
+            continue;
+          }
           // 공동 후보마다 같은 전체 인벤토리 재고에서 독립적으로 시작한다.
           const res=await jointReallocate(L.layoutTeam,{pass,candidate:{label},candidateIndex:q+1});
           const variants=Array.isArray(res?.variants)?res.variants:(res?.team?[res]:[]);
@@ -7214,7 +7247,10 @@ async function optimizeRosterPositions(inputTeam,{preliminary=false,jointMode=fa
           for(const v of variants.slice(0,accurate?2:1)){
             if(!v?.team)continue;
             const r2=await polishTeam(cloneOptimizerTeam(v.team),`전체 재고 재배정 후보 ${q+1} 장비 정밀 교환`,candBudget);
-            cands.push({label:`${label} · 전체 인벤토리 재배정${v.order?` (${v.order})`:''}${r2.accepted.length?` + 정밀 교환 ${r2.accepted.length}회`:''}`,team:r2.team,kind:L.kind,reallocated:true,polished:r2.accepted});
+            const orderText=v.order?` (${v.order})`:'';
+            const cand={label:`${label} · 전체 인벤토리 재배정${orderText}${r2.accepted.length?` + 정밀 교환 ${r2.accepted.length}회`:''}`,team:r2.team,kind:L.kind,reallocated:true,polished:r2.accepted,orderText};
+            cands.push(cand);
+            if(layoutKey){if(!layoutResults.has(layoutKey))layoutResults.set(layoutKey,[]);layoutResults.get(layoutKey).push(cand);}
             totalRealloc++;
           }
           if(!variants.length)failedRealloc++;
@@ -7229,14 +7265,14 @@ async function optimizeRosterPositions(inputTeam,{preliminary=false,jointMode=fa
     // 3) 레이싱 검증: 모든 후보를 새 난수 구간에서 짝지은 비교 → 상위 후보만 표본 추가
     const VF=200000+pass*50000,Tb=fbPrepareTeam(team,true);
     const baseA=fbSamples(Tb,C,passSeed,VF,verifyA,ctx);
-    for(const c of cands){c.T=fbPrepareTeam(c.team,true);c.sa=fbSamples(c.T,C,passSeed,VF,verifyA,ctx);const pr=fbPair(c.sa,baseA);c.meanA=pr.mean;c.seA=pr.se;}
+    for(const c of cands){if(c.sameAs){c.T=c.sameAs.T;c.sa=c.sameAs.sa;}else{c.T=fbPrepareTeam(c.team,true);c.sa=fbSamples(c.T,C,passSeed,VF,verifyA,ctx);}const pr=fbPair(c.sa,baseA);c.meanA=pr.mean;c.seA=pr.se;}
     cands.sort((a,b)=>b.meanA-a.meanA);
     const mustVerify=cands.filter(c=>c.reallocated&&['backBlockSwap','darkBack'].includes(c.kind));
     const finalistList=[...mustVerify];
     for(const c of cands){if(finalistList.length>=Math.max(3,mustVerify.length))break;if(!finalistList.includes(c))finalistList.push(c);}
     const finalists=finalistList,baseB=fbSamples(Tb,C,passSeed,VF+verifyA,verifyB,ctx),baseAll=fbConcat(baseA,baseB),zSel=2.3,rows=[];
     for(const c of finalists){
-      c.sb=fbSamples(c.T,C,passSeed,VF+verifyA,verifyB,ctx);const pr=fbPair(fbConcat(c.sa,c.sb),baseAll);
+      const sampleOwner=c.sameAs||c;if(!sampleOwner.sb)sampleOwner.sb=fbSamples(c.T,C,passSeed,VF+verifyA,verifyB,ctx);c.sb=sampleOwner.sb;const pr=fbPair(fbConcat(c.sa,c.sb),baseAll);
       c.mean=pr.mean;c.lower=pr.mean-zSel*pr.se;c.upper=pr.mean+zSel*pr.se;
       rows.push({pass:pass+1,label:c.label,kind:c.kind,delta:pr.mean,lower:c.lower,upper:c.upper,decision:c.lower>0?'개선 확인':c.upper<0?'피해 감소':'우열 불확실'});
       status(`자리 후보 정밀 검증 ${rows.length}/${finalists.length}`);await yieldToBrowser();
@@ -7266,7 +7302,7 @@ async function optimizeRosterPositions(inputTeam,{preliminary=false,jointMode=fa
   const visibleReviewRows=reviewRows.filter((r,i)=>i>=Math.max(0,reviewRows.length-24)||['backBlockSwap','darkBack'].includes(r.kind));
   const rowsHtml=visibleReviewRows.map(r=>`<tr><td>${r.pass}차 · ${{structural:'구조 후보',cycle:'3개 순환',swap:'2개 교환',backBlockSwap:'뒷열 구역 교환',darkBack:'어둠 후방 우선'}[r.kind]||'배치 후보'}<br>${esc(r.label)}</td><td>${r.delta>=0?'+':''}${fmt(Math.round(r.delta))}</td><td>${fmt(Math.round(r.lower))} ~ ${fmt(Math.round(r.upper))}</td><td>${r.decision}</td></tr>`).join('');
   const polishHtml=polishLog.length?`<details><summary>실전투 장비 교환 ${polishLog.length}회 채택 내역</summary><div class="hint">${polishLog.map(p=>`${esc(p.label)} · +${fmt(Math.round(p.delta))}`).join('<br>')}</div></details>`:'';
-  const summaryText=layoutSearch?`2교환 ${totalSwapLayouts}개 · 3순환 ${totalCycleLayouts}개 실전투 선별 · 추가 구역 교환 후보 ${blockSwapCandidates}개 · 어둠속성 공격형 후방 후보 ${darkBackCandidates}개 · 완성 후보 ${totalCandidates}개${jointMode&&typeof jointReallocate==='function'?`(전체 인벤토리 재배정 ${totalRealloc}개)`:''} · 장비 교환 채택 ${polishMoves}회 · 자리 변경 채택 ${acceptedMoves}회`:`장비 교환 채택 ${polishMoves}회 (자리배치 최적화 미사용)`;
+  const summaryText=layoutSearch?`2교환 ${totalSwapLayouts}개 · 3순환 ${totalCycleLayouts}개 실전투 선별 · 추가 구역 교환 후보 ${blockSwapCandidates}개 · 어둠속성 공격형 후방 후보 ${darkBackCandidates}개 · 완성 후보 ${totalCandidates}개${jointMode&&typeof jointReallocate==='function'?`(전체 인벤토리 재배정 ${totalRealloc}개${reusedRealloc?`, 그중 같은 결과라 재사용 ${reusedRealloc}개`:''})`:''} · 장비 교환 채택 ${polishMoves}회 · 자리 변경 채택 ${acceptedMoves}회`:`장비 교환 채택 ${polishMoves}회 (자리배치 최적화 미사용)`;
   const diagnostics=layoutSearch?makePositionDiagnosticsHtml(team,reportFinal,reportBase,overall):'';
   const html=`<div class="result" style="margin-top:14px"><h3>${layoutSearch?'자리 배치·장비 공동 최적화 결과':'실전투 장비 정밀 교환 결과'} (v5.33)</h3><p class="hint">${layoutSearch?'앞열·뒷열을 유지하며 모든 열 내 2교환·3순환을 실제 전투 피해로 선별합니다. 추가 독립 후보로 뒷열 11~14번과 17~20번 구역 교환, 어둠 속성을 20번에 가까운 자리부터 배치하는 전략을 평가합니다. 공동 최적화에서는 정밀 평가 대상으로 선별한 각 배치 후보의 활성 용 장비를 기존 장착분과 미사용분이 합쳐진 현재 전체 인벤토리에서 처음부터 독립 재배정합니다.':'현재 장비를 기준으로 용 사이 장비 교환과 미사용 재고 대체를 실제 전투(공통 난수)로 평가해 개선을 반복 적용합니다.'} 후보 채택은 팀 전체 평균 누적 피해량으로 판단하며, 생존·피격·공격 기회 지표는 원인 진단용입니다. 모든 장비 배정은 현재 인벤토리 수량 검증을 통과해야 하고, 마지막 독립 표본에서 전체 개선이 확인되지 않으면 기존 팀을 유지합니다. 4개 이상의 동시 순환과 전역 최적해는 보장하지 않습니다.</p><p><b>${summaryText}</b>${failedRealloc?` · 재배정 실패 ${failedRealloc}개`:''}</p><p><b>기존 평균:</b> ${fmt(reportBase.damage)} · <b>최종 평균:</b> ${fmt(reportFinal.damage)} · <b>차이:</b> ${overall&&overall.mean>=0?'+':''}${fmt(overall?overall.mean:0)} (${pct>=0?'+':''}${pct.toFixed(2)}%) · <b>95% CI:</b> ${overall?`${fmt(overall.lower)} ~ ${fmt(overall.upper)}`:'—'}</p>${reverted?'<p class="warn"><b>최종 판정:</b> 합친 개선이 새 난수 구간에서 확인되지 않아 원래 배치·장비로 되돌렸습니다.</p>':changed?`<p class="good"><b>최종 판정:</b> 새 난수 구간에서도 개선이 확인되어 채택했습니다.${acceptedLabels.length?'<br>'+acceptedLabels.map(esc).join('<br>'):''}</p>`:'<p><b>최종 판정:</b> 통계적으로 확실한 개선을 찾지 못해 기존 배치·장비를 유지했습니다.</p>'}${polishHtml}${reviewRows.length?`<div class="table-wrap"><table class="optimizer-result-table"><thead><tr><th>패스·후보</th><th>팀 누적 피해 평균 변화</th><th>보정 신뢰구간</th><th>판정</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`:''}${diagnostics}</div>`;
   return {
@@ -7633,6 +7669,22 @@ async function runRegressionTests(onProgress){
     }
   add('G. 성능 캐시','스탯 계산 캐시를 써도 근사 점수가 같다',cached.every((v,k)=>v===plain[k]),`팀 점수 ${cached[0].toFixed(3)} / ${plain[0].toFixed(3)}, 물약 ${cached[1].toFixed(3)} / ${plain[1].toFixed(3)}, 자리 ${cached[2].toFixed(3)} / ${plain[2].toFixed(3)}, 후보 델타 ${cached[3].toFixed(4)} / ${plain[3].toFixed(4)}`);
   add('G. 성능 캐시','캐시 구간이 끝나면 캐시가 비워진다',calcDragonScopeCache===null,calcDragonScopeCache===null?'비워짐':'구간 밖에 캐시가 남아 있음');}
+ await step('성능 정리');
+ {const G='S. 성능 정리',rl=getBossRules();let rnd=fbMix(12345),bad=0;const next=()=>{rnd=fbMix(rnd+1);return rnd/4294967296;};
+  for(let t=0;t<3000;t++){
+   const n=t%5===0?15:20,alive=new Uint8Array(n);for(let i=0;i<n;i++)alive[i]=next()<(t%4+1)/5?1:0;
+   const u=next(),a=rl.pickRankedLane(l=>alive[l]===1,l=>l+10<n&&alive[l+10]===1,u,[]),b=rl.pickRankedLaneFromAlive(alive,n,u,new Int16Array(10));
+   if(a!==b)bad++;
+  }
+  add(G,'전투 엔진용 열 선택이 규칙 원본과 같다',bad===0,`무작위 생존 조합 3,000개 중 불일치 ${bad}개`);
+  let badU=0;for(let t=0;t<3000;t++){const base=fbMix(t*7+1),a=t%4000,b=t%20,c=t%3;if(fbU(base,a,b,c)!==fbUPart(fbUPrefix(base,a,b),c))badU++;}
+  add(G,'나눠 계산한 난수가 원래 난수와 같다',badU===0,`3,000개 중 불일치 ${badU}개`);
+  const team=defaults().map((d,i)=>i===2||i===16?{...d,active:false}:d);let badP=0;
+  for(const expanded of [false,true])for(let i=0;i<20;i++){const lane=i<10?i:i-10;if(getPierceTargetProbabilityForIndex(i,team,expanded)!==(getPierceTargetWeights(team,expanded)[lane]||0))badP++;}
+  add(G,'관통 확률을 한 열만 계산해도 전체 계산과 같다',badP===0,`40개 중 불일치 ${badP}개`);
+  const layout=defaults(),swapped=layout.slice();swapped[0]={...layout[1]};swapped[1]={...layout[0]};
+  const changed=layout.slice();changed[0]={...layout[10]};changed[10]={...layout[0]};
+  add(G,'스탯이 같은 용의 자리 바꿈만 같은 재배정으로 묶는다',inventoryLayoutKey(layout)===inventoryLayoutKey(swapped)&&inventoryLayoutKey(layout)!==inventoryLayoutKey(changed),`탱커끼리 ${inventoryLayoutKey(layout)===inventoryLayoutKey(swapped)?'같음':'다름'} · 탱커↔딜러 ${inventoryLayoutKey(layout)!==inventoryLayoutKey(changed)?'다름':'같음'}`);}
  await step('완료');
  return results;
 }
